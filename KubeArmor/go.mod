@@ -27,7 +27,7 @@ require (
 	github.com/Masterminds/sprig/v3 v3.2.3
 	github.com/cilium/cilium v1.14.9
 	github.com/cilium/ebpf v0.12.3
-	github.com/containerd/containerd v1.7.13
+	github.com/containerd/containerd v1.7.17
 	github.com/containerd/typeurl/v2 v2.1.1
 	github.com/docker/docker v25.0.5+incompatible
 	github.com/golang/protobuf v1.5.4
@@ -53,10 +53,10 @@ require (
 require (
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.2.1 // indirect
-	github.com/Microsoft/go-winio v0.6.1 // indirect
+	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
-	github.com/containerd/ttrpc v1.2.3 // indirect
+	github.com/containerd/ttrpc v1.2.4 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.5.0 // indirect
 	github.com/docker/go-connections v0.5.0 // indirect
@@ -112,7 +112,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.25.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.22.0 // indirect
-	golang.org/x/mod v0.17.0 // indirect
 	golang.org/x/net v0.24.0 // indirect
 	golang.org/x/oauth2 v0.17.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
