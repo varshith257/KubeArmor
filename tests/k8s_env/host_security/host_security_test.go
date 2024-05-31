@@ -1,4 +1,4 @@
-package hostsecurity_test
+package hostsecurity
 
 import (
     "fmt"
