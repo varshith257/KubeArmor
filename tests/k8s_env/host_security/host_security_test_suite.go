@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Authors of KubeArmor
 
-package hostsecurity_test
+package hostsecurity
 
 import (
     "testing"

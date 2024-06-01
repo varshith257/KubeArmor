@@ -124,7 +124,9 @@ jobs:
         env:
           GOPATH: /home/runner/go
 
-      - uses: codecov/codecov-action@v3
+      - name: Upload coverage to Codecov
         if: ${{ always() }}
-        with:
-          files: ./KubeArmor/gover.coverprofile
+        uses: codecov/codecov-action@v4.0.1
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        
