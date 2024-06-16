@@ -23,8 +23,8 @@ import (
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer ../../BPF/enforcer.bpf.c -- -I/usr/include/bpf -O2 -g
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer_path ../../BPF/enforcer_path.bpf.c -- -I/usr/include/bpf -O2 -g
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer ../../BPF/enforcer.bpf.c -- -I/usr/include/ -O2 -g
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer_path ../../BPF/enforcer_path.bpf.c -- -I/usr/include/ -O2 -g
 
 // ===================== //
 // == BPFLSM Enforcer == //
@@ -139,6 +139,11 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceNetAccept.String(), err)
 		return be, err
 	}
+	be.Probes[be.obj.EnforceCap.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceCap})
+	if err != nil {
+		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceCap.String(), err)
+		return be, err
+	}
 
 	/*
 		Path Hooks
@@ -219,7 +224,7 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		}
 	}
 
-	be.Events, err = ringbuf.NewReader(be.obj.Events)
+	be.Events, err = ringbuf.NewReader(be.obj.KubearmorEvents)
 	if err != nil {
 		be.Logger.Errf("opening ringbuf reader: %s", err)
 		return be, err
@@ -249,7 +254,8 @@ type eventBPF struct {
 	UID  uint32
 
 	EventID int32
-	Retval  int64
+
+	Retval int64
 
 	Comm [80]byte
 
@@ -294,6 +300,10 @@ func (be *BPFEnforcer) TraceEvents() {
 			continue
 		}
 
+		readLink := false
+		if len(string(bytes.Trim(event.Data.Source[:], "\x00"))) == 0 {
+			readLink = true
+		}
 		containerID := ""
 
 		if event.PidID != 0 && event.MntID != 0 {
@@ -310,23 +320,19 @@ func (be *BPFEnforcer) TraceEvents() {
 				HostPID:  event.HostPID,
 				HostPPID: event.HostPPID,
 			},
-		})
+		}, readLink)
 
 		switch event.EventID {
 
 		case mon.FileOpen, mon.FilePermission, mon.FileMknod, mon.FileMkdir, mon.FileRmdir, mon.FileUnlink, mon.FileSymlink, mon.FileLink, mon.FileRename, mon.FileChmod, mon.FileTruncate:
 			log.Operation = "File"
 			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
-			log.Enforcer = "BPFLSM"
-			log.Result = "Permission denied"
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
 
 		case mon.SocketCreate, mon.SocketConnect, mon.SocketAccept:
 			var sockProtocol int32
 			sockProtocol = int32(event.Data.Path[1])
 			log.Operation = "Network"
-			log.Enforcer = "BPFLSM"
-			log.Result = "Permission denied"
 			if event.Data.Path[0] == 2 {
 				if event.Data.Path[1] == 3 {
 					log.Resource = fd.GetProtocolFromName("raw")
@@ -340,11 +346,29 @@ func (be *BPFEnforcer) TraceEvents() {
 			log.Operation = "Process"
 			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
 			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
-			log.Enforcer = "BPFLSM"
-			log.Result = "Permission denied"
+			log.ProcessName = log.Resource
+			log.ParentProcessName = log.Source
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
-		}
 
+		case mon.Capable:
+			log.Operation = "Capabilities"
+			log.Resource = mon.Capabilities[int32(event.Data.Path[1])]
+			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID)) + " " + log.Resource
+		}
+		// fallback logic if we don't receive source from BuildLogBase()
+		if len(log.Source) == 0 {
+			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
+			log.ProcessName = log.Source
+		}
+		if len(log.ProcessName) == 0 && len(log.Source) > 0 {
+			log.ProcessName = log.Source
+		}
+		if event.Retval >= 0 {
+			log.Result = "Passed"
+		} else {
+			log.Result = "Permission denied"
+		}
+		log.Enforcer = "BPFLSM"
 		be.Logger.PushLog(log)
 
 	}
@@ -381,12 +405,11 @@ func (be *BPFEnforcer) DestroyBPFEnforcer() error {
 	if be == nil {
 		return nil
 	}
-
-	errBPFCleanUp := false
+	var errBPFCleanUp error
 
 	if err := be.obj.Close(); err != nil {
 		be.Logger.Err(err.Error())
-		errBPFCleanUp = true
+		errBPFCleanUp = errors.Join(errBPFCleanUp, err)
 	}
 
 	for _, link := range be.Probes {
@@ -395,33 +418,41 @@ func (be *BPFEnforcer) DestroyBPFEnforcer() error {
 		}
 		if err := link.Close(); err != nil {
 			be.Logger.Err(err.Error())
-			errBPFCleanUp = true
+			errBPFCleanUp = errors.Join(errBPFCleanUp, err)
+
 		}
 	}
 
 	be.ContainerMapLock.Lock()
-	defer be.ContainerMapLock.Unlock()
 
 	if be.BPFContainerMap != nil {
 		if err := be.BPFContainerMap.Unpin(); err != nil {
 			be.Logger.Err(err.Error())
-			errBPFCleanUp = true
+			errBPFCleanUp = errors.Join(errBPFCleanUp, err)
 		}
 		if err := be.BPFContainerMap.Close(); err != nil {
 			be.Logger.Err(err.Error())
-			errBPFCleanUp = true
+			errBPFCleanUp = errors.Join(errBPFCleanUp, err)
 		}
 	}
 
-	if err := be.Events.Close(); err != nil {
-		be.Logger.Err(err.Error())
-		errBPFCleanUp = true
-	}
+	be.ContainerMapLock.Unlock()
 
-	if errBPFCleanUp {
-		return errors.New("error cleaning up BPF LSM Enforcer Objects")
+	if be.Events != nil {
+		if err := be.obj.KubearmorEvents.Unpin(); err != nil {
+			be.Logger.Err(err.Error())
+			errBPFCleanUp = errors.Join(errBPFCleanUp, err)
+		}
+		if err := be.obj.KubearmorEvents.Close(); err != nil {
+			be.Logger.Err(err.Error())
+			errBPFCleanUp = errors.Join(errBPFCleanUp, err)
+		}
+		if err := be.Events.Close(); err != nil {
+			be.Logger.Err(err.Error())
+			errBPFCleanUp = errors.Join(errBPFCleanUp, err)
+		}
 	}
 
 	be = nil
-	return nil
+	return errBPFCleanUp
 }

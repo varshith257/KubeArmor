@@ -5,6 +5,7 @@
 package core
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,8 +17,12 @@ import (
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 	"github.com/kubearmor/KubeArmor/KubeArmor/policy"
+	"github.com/kubearmor/KubeArmor/KubeArmor/state"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+	"k8s.io/client-go/tools/cache"
 
 	efc "github.com/kubearmor/KubeArmor/KubeArmor/enforcer"
 	fd "github.com/kubearmor/KubeArmor/KubeArmor/feeder"
@@ -60,6 +65,9 @@ type KubeArmorDaemon struct {
 	EndPoints     []tp.EndPoint
 	EndPointsLock *sync.RWMutex
 
+	// Owner Info
+	OwnerInfo map[string]tp.PodOwner
+
 	// Security policies
 	SecurityPolicies     []tp.SecurityPolicy
 	SecurityPoliciesLock *sync.RWMutex
@@ -88,11 +96,17 @@ type KubeArmorDaemon struct {
 	// kvm agent
 	KVMAgent *kvm.KVMAgent
 
+	// state agent
+	StateAgent *state.StateAgent
+
 	// WgDaemon Handler
 	WgDaemon sync.WaitGroup
 
 	// system monitor lock
 	MonitorLock *sync.RWMutex
+
+	// health-server
+	GRPCHealthServer *health.Server
 }
 
 // NewKubeArmorDaemon Function
@@ -133,11 +147,15 @@ func NewKubeArmorDaemon() *KubeArmorDaemon {
 
 	dm.MonitorLock = new(sync.RWMutex)
 
+	dm.OwnerInfo = map[string]tp.PodOwner{}
+
 	return dm
 }
 
 // DestroyKubeArmorDaemon Function
 func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
+	close(StopChan)
+
 	if dm.RuntimeEnforcer != nil {
 		// close runtime enforcer
 		if dm.CloseRuntimeEnforcer() {
@@ -163,6 +181,13 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 		dm.Logger.Print("Terminated KubeArmor")
 	} else {
 		kg.Print("Terminated KubeArmor")
+	}
+
+	if dm.StateAgent != nil {
+		//go dm.StateAgent.PushNodeEvent(dm.Node, state.EventDeleted)
+		if dm.CloseStateAgent() {
+			kg.Print("Destroyed StateAgent")
+		}
 	}
 
 	// wait for a while
@@ -300,6 +325,25 @@ func (dm *KubeArmorDaemon) CloseKVMAgent() bool {
 	return true
 }
 
+// ================= //
+// == State Agent == //
+// ================= //
+
+// InitStateAgent Function
+func (dm *KubeArmorDaemon) InitStateAgent() bool {
+	dm.StateAgent = state.NewStateAgent(&dm.Node, dm.NodeLock, dm.Containers, dm.ContainersLock)
+	return dm.StateAgent != nil
+}
+
+// CloseStateAgent Function
+func (dm *KubeArmorDaemon) CloseStateAgent() bool {
+	if err := dm.StateAgent.DestroyStateAgent(); err != nil {
+		dm.Logger.Errf("Failed to destory State Agent (%s)", err.Error())
+		return false
+	}
+	return true
+}
+
 // ==================== //
 // == Signal Handler == //
 // ==================== //
@@ -318,6 +362,18 @@ func GetOSSigChannel() chan os.Signal {
 	return c
 }
 
+// =================== //
+// == Health Server == //
+// =================== //
+func (dm *KubeArmorDaemon) SetHealthStatus(serviceName string, healthStatus grpc_health_v1.HealthCheckResponse_ServingStatus) bool {
+	if dm.GRPCHealthServer != nil {
+		dm.GRPCHealthServer.SetServingStatus(serviceName, healthStatus)
+		return true
+	}
+
+	return false
+}
+
 // ========== //
 // == Main == //
 // ========== //
@@ -334,6 +390,12 @@ func KubeArmor() {
 		dm.Node.NodeName = cfg.GlobalCfg.Host
 		dm.Node.NodeIP = kl.GetExternalIPAddr()
 
+		// add identity for matching node selector
+		dm.Node.Labels = make(map[string]string)
+		dm.Node.Labels["kubearmor.io/hostname"] = dm.Node.NodeName
+
+		dm.Node.Identities = append(dm.Node.Identities, "kubearmor.io/hostname"+"="+dm.Node.NodeName)
+
 		dm.Node.Annotations = map[string]string{}
 		dm.HandleNodeAnnotations(&dm.Node)
 
@@ -344,6 +406,8 @@ func KubeArmor() {
 				break
 			}
 		}
+
+		dm.Node.LastUpdatedAt = kl.GetBootTime()
 
 		dm.Node.KernelVersion = kl.GetCommandOutputWithoutErr("uname", []string{"-r"})
 		dm.Node.KernelVersion = strings.TrimSuffix(dm.Node.KernelVersion, "\n")
@@ -426,6 +490,39 @@ func KubeArmor() {
 		return
 	}
 	dm.Logger.Print("Initialized KubeArmor Logger")
+
+	// == //
+
+	// health server
+	if dm.Logger.LogServer != nil {
+		dm.GRPCHealthServer = health.NewServer()
+		grpc_health_v1.RegisterHealthServer(dm.Logger.LogServer, dm.GRPCHealthServer)
+	}
+
+	// Init StateAgent
+	if !dm.K8sEnabled && cfg.GlobalCfg.StateAgent {
+		dm.NodeLock.Lock()
+		dm.Node.ClusterName = cfg.GlobalCfg.Cluster
+		dm.NodeLock.Unlock()
+
+		// initialize state agent
+		if !dm.InitStateAgent() {
+			dm.Logger.Err("Failed to initialize State Agent Server")
+
+			// destroy the daemon
+			dm.DestroyKubeArmorDaemon()
+
+			return
+		}
+		dm.Logger.Print("Initialized State Agent Server")
+
+		pb.RegisterStateAgentServer(dm.Logger.LogServer, dm.StateAgent)
+		dm.SetHealthStatus(pb.StateAgent_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	}
+
+	if dm.StateAgent != nil {
+		go dm.StateAgent.PushNodeEvent(dm.Node, state.EventAdded)
+	}
 
 	// == //
 
@@ -609,22 +706,59 @@ func KubeArmor() {
 	// == //
 
 	if dm.K8sEnabled && cfg.GlobalCfg.Policy {
-		// watch k8s pods
-		go dm.WatchK8sPods()
-		dm.Logger.Print("Started to monitor Pod events")
+		timeout, err := time.ParseDuration(cfg.GlobalCfg.InitTimeout)
+		if err != nil {
+			dm.Logger.Warnf("Not a valid InitTimeout duration: %q, defaulting to '60s'", cfg.GlobalCfg.InitTimeout)
+			timeout = 60 * time.Second
+		}
 
 		// watch security policies
-		go dm.WatchSecurityPolicies()
+		securityPoliciesSynced := dm.WatchSecurityPolicies()
+		if securityPoliciesSynced == nil {
+			// destroy the daemon
+			dm.DestroyKubeArmorDaemon()
+
+			return
+		}
 		dm.Logger.Print("Started to monitor security policies")
 
 		// watch default posture
-		go dm.WatchDefaultPosture()
+		defaultPostureSynced := dm.WatchDefaultPosture()
+		if defaultPostureSynced == nil {
+			// destroy the daemon
+			dm.DestroyKubeArmorDaemon()
+
+			return
+		}
 		dm.Logger.Print("Started to monitor per-namespace default posture")
 
 		// watch kubearmor configmap
-		go dm.WatchConfigMap()
+		configMapSynced := dm.WatchConfigMap()
+		if configMapSynced == nil {
+			// destroy the daemon
+			dm.DestroyKubeArmorDaemon()
+
+			return
+		}
 		dm.Logger.Print("Watching for posture changes")
 
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		synced := cache.WaitForCacheSync(ctx.Done(), securityPoliciesSynced, defaultPostureSynced, configMapSynced)
+		if !synced {
+			dm.Logger.Err("Failed to sync Kubernetes informers")
+
+			// destroy the daemon
+			dm.DestroyKubeArmorDaemon()
+
+			return
+		}
+
+		// watch k8s pods (function never returns, must be called in a
+		// goroutine)
+		go dm.WatchK8sPods()
+		dm.Logger.Print("Started to monitor Pod events")
 	}
 
 	if dm.K8sEnabled && cfg.GlobalCfg.HostPolicy {
@@ -634,7 +768,7 @@ func KubeArmor() {
 	}
 
 	if !dm.K8sEnabled && (enableContainerPolicy || cfg.GlobalCfg.HostPolicy) {
-		policyService := &policy.ServiceServer{}
+		policyService := &policy.PolicyServer{}
 		if enableContainerPolicy {
 			policyService.UpdateContainerPolicy = dm.ParseAndUpdateContainerSecurityPolicy
 			dm.Logger.Print("Started to monitor container security policies on gRPC")
@@ -645,11 +779,13 @@ func KubeArmor() {
 			dm.Logger.Print("Started to monitor host security policies on gRPC")
 		}
 		pb.RegisterPolicyServiceServer(dm.Logger.LogServer, policyService)
+
 		//Enable grpc service to send kubearmor data to client in unorchestrated mode
 		probe := &Probe{}
 		probe.GetContainerData = dm.SetProbeContainerData
 		pb.RegisterProbeServiceServer(dm.Logger.LogServer, probe)
 
+		dm.SetHealthStatus(pb.PolicyService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 	}
 
 	reflection.Register(dm.Logger.LogServer) // Helps grpc clients list out what all svc/endpoints available
@@ -657,6 +793,7 @@ func KubeArmor() {
 	// serve log feeds
 	go dm.ServeLogFeeds()
 	dm.Logger.Print("Started to serve gRPC-based log feeds")
+	dm.SetHealthStatus(pb.LogService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 
 	// == //
 	go dm.SetKarmorData()
@@ -694,7 +831,6 @@ func KubeArmor() {
 		sigChan := GetOSSigChannel()
 		<-sigChan
 		dm.Logger.Print("Got a signal to terminate KubeArmor")
-		close(StopChan)
 	}
 
 	// destroy the daemon

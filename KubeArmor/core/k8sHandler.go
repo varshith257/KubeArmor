@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -23,7 +24,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
-	"github.com/kubearmor/KubeArmor/KubeArmor/log"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 	kspclient "github.com/kubearmor/KubeArmor/pkg/KubeArmorController/client/clientset/versioned"
 )
@@ -84,13 +84,13 @@ func NewK8sHandler() *K8sHandler {
 	}
 	config, err := ctrl.GetConfig()
 	if err != nil {
-		log.Warnf("Error creating kubernetes config, %s", err)
+		kg.Warnf("Error creating kubernetes config, %s", err)
 		return kh
 	}
 
 	kh.KSPClient, err = kspclient.NewForConfig(config)
 	if err != nil {
-		log.Warnf("Error creating ksp clientset, %s", err)
+		kg.Warnf("Error creating ksp clientset, %s", err)
 		return kh
 	}
 
@@ -287,16 +287,15 @@ func (kh *K8sHandler) PatchResourceWithAppArmorAnnotations(namespaceName, deploy
 		}
 		return nil
 
-	} else if kind == "Pod" {
-		_, err := kh.K8sClient.CoreV1().Pods(namespaceName).Patch(context.Background(), deploymentName, types.MergePatchType, []byte(spec), metav1.PatchOptions{})
+	} else if kind == "Deployment" {
+		_, err := kh.K8sClient.AppsV1().Deployments(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, []byte(spec), metav1.PatchOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
+	} else if kind == "Pod" {
+		// this condition wont be triggered, handled by controller
+		return nil
 
-	}
-	_, err := kh.K8sClient.AppsV1().Deployments(namespaceName).Patch(context.Background(), deploymentName, types.StrategicMergePatchType, []byte(spec), metav1.PatchOptions{})
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -422,13 +421,19 @@ func (kh *K8sHandler) GetStatefulSet(namespaceName, podownerName string) (string
 // ========== //
 
 // WatchK8sPods Function
-func (kh *K8sHandler) WatchK8sPods() *http.Response {
+func (kh *K8sHandler) WatchK8sPods(nodeName string) *http.Response {
 	if !kl.IsK8sEnv() { // not Kubernetes
 		return nil
 	}
 
+	queryParams := url.Values{}
+	if nodeName != "" {
+		queryParams.Add("fieldSelector", "spec.nodeName="+nodeName)
+	}
+	queryParams.Add("watch", "true")
+
 	if kl.IsInK8sCluster() { // kube-apiserver
-		URL := "https://" + kh.K8sHost + ":" + kh.K8sPort + "/api/v1/pods?watch=true"
+		URL := "https://" + kh.K8sHost + ":" + kh.K8sPort + "/api/v1/pods?" + queryParams.Encode()
 
 		req, err := http.NewRequest("GET", URL, nil)
 		if err != nil {
@@ -447,7 +452,7 @@ func (kh *K8sHandler) WatchK8sPods() *http.Response {
 	}
 
 	// kube-proxy (local)
-	URL := "http://" + kh.K8sHost + ":" + kh.K8sPort + "/api/v1/pods?watch=true"
+	URL := "http://" + kh.K8sHost + ":" + kh.K8sPort + "/api/v1/pods?" + queryParams.Encode()
 
 	if resp, err := http.Get(URL); err == nil /* #nosec */ {
 		return resp
@@ -586,6 +591,24 @@ func getTopLevelOwner(obj metav1.ObjectMeta, namespace string, objkind string) (
 		if len(pod.OwnerReferences) > 0 {
 			return getTopLevelOwner(pod.ObjectMeta, namespace, "Pod")
 		}
+	case "Job":
+		job, err := K8s.K8sClient.BatchV1().Jobs(namespace).Get(context.Background(), ownerRef.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", "", "", err
+		}
+		if len(job.OwnerReferences) > 0 {
+			return getTopLevelOwner(job.ObjectMeta, namespace, "CronJob")
+		}
+		return job.Name, "Job", job.Namespace, nil
+	case "CronJob":
+		cronJob, err := K8s.K8sClient.BatchV1().CronJobs(namespace).Get(context.Background(), ownerRef.Name, metav1.GetOptions{})
+		if err != nil {
+			return "", "", "", err
+		}
+		if len(cronJob.OwnerReferences) > 0 {
+			return getTopLevelOwner(cronJob.ObjectMeta, namespace, "CronJob")
+		}
+		return cronJob.Name, "CronJob", cronJob.Namespace, nil
 	case "Deployment":
 		deployment, err := K8s.K8sClient.AppsV1().Deployments(namespace).Get(context.Background(), ownerRef.Name, metav1.GetOptions{})
 		if err != nil {

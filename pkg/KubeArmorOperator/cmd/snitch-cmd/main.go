@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2021 Authors of KubeArmor
 
-// Package cmd is the collection of all the subcommands available in kArmor while providing relevant options for the same
+// Package snitch is the collection of all the subcommands available in kArmor while providing relevant options for the same
 package main
 
 import (
@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/kubearmor/KubeArmor/pkg/KubeArmorOperator/seccomp"
 
 	"github.com/kubearmor/KubeArmor/pkg/KubeArmorOperator/common"
 	"github.com/kubearmor/KubeArmor/pkg/KubeArmorOperator/enforcer"
@@ -96,8 +98,13 @@ func Execute() {
 func snitch() {
 	order := strings.Split(LsmOrder, ",")
 
+	seccomp.LoadSeccompInNode()
+
 	// Detecting enforcer
 	nodeEnforcer := enforcer.DetectEnforcer(order, PathPrefix, *Logger)
+	if (nodeEnforcer == "apparmor") && (enforcer.CheckIfApparmorFsPresent(PathPrefix, *Logger) == "no") {
+		nodeEnforcer = "NA"
+	}
 	if nodeEnforcer != "NA" {
 		Logger.Infof("Node enforcer is %s", nodeEnforcer)
 	} else {
@@ -114,13 +121,6 @@ func snitch() {
 		Logger.Errorf("Not able to detect runtime")
 		os.Exit(1)
 	}
-	runtimeStorage := runtimepkg.DetectRuntimeStorage(PathPrefix, runtime, *Logger)
-	if runtimeStorage != "NA" {
-		Logger.Infof("Detected runtime storage location %s", runtimeStorage)
-	} else {
-		Logger.Errorf("Not able to detect runtime storage location")
-		os.Exit(1)
-	}
 
 	// Check BTF support
 	btfPresent := enforcer.CheckBtfSupport(PathPrefix, *Logger)
@@ -129,11 +129,19 @@ func snitch() {
 	patchNode := metadata{}
 	patchNode.Metadata.Labels = map[string]string{}
 	patchNode.Metadata.Labels[common.RuntimeLabel] = runtime
+	patchNode.Metadata.Labels[common.SeccompLabel] = seccomp.CheckIfSeccompProfilePresent()
 	patchNode.Metadata.Labels[common.SocketLabel] = strings.ReplaceAll(socket[1:], "/", "_")
 	patchNode.Metadata.Labels[common.EnforcerLabel] = nodeEnforcer
-	patchNode.Metadata.Labels[common.RuntimeStorageLabel] = strings.ReplaceAll(runtimeStorage[1:], "/", "_")
 	patchNode.Metadata.Labels[common.RandLabel] = rand.String(4)
 	patchNode.Metadata.Labels[common.BTFLabel] = btfPresent
+	patchNode.Metadata.Labels[common.ApparmorFsLabel] = enforcer.CheckIfApparmorFsPresent(PathPrefix, *Logger)
+
+	if nodeEnforcer == "none" {
+		patchNode.Metadata.Labels[common.SecurityFsLabel] = "no"
+	} else {
+		patchNode.Metadata.Labels[common.SecurityFsLabel] = enforcer.CheckIfSecurityFsPresent(PathPrefix, *Logger)
+	}
+
 	patch, err := json.Marshal(patchNode)
 
 	if err != nil {

@@ -24,7 +24,7 @@ type EventResult struct {
 }
 
 var eventChan chan klog.EventInfo
-var gRPC = "localhost:32767"
+var gRPC = ""
 
 const maxEvents = 128
 
@@ -159,6 +159,7 @@ func KarmorGetTargetAlert(timeout time.Duration, target *pb.Alert) (EventResult,
 			} else if evtin.Type != "Log" {
 				log.Errorf("UNKNOWN EVT type %s", evtin.Type)
 			}
+
 			if getAlertWithInfo(&alert, target) {
 				log.Printf("Found Target Alert")
 				fmt.Printf("Alert: %s\n", &alert)
@@ -188,18 +189,22 @@ func KarmorLogStart(logFilter string, ns string, op string, pod string) error {
 	}
 	go func() {
 		err := klog.StartObserver(k8sClient, klog.Options{
-			LogFilter: logFilter,
-			Namespace: ns,
-			Operation: op,
-			PodName:   pod,
-			MsgPath:   "none",
-			EventChan: eventChan,
-			GRPC:      gRPC,
+			LogFilter:        logFilter,
+			ReadCAFromSecret: true,
+			TlsCertPath:      "/var/lib/kubearmor/tls",
+			TlsCertProvider:  klog.SelfCertProvider,
+			Namespace:        ns,
+			Operation:        op,
+			PodName:          pod,
+			MsgPath:          "none",
+			EventChan:        eventChan,
+			GRPC:             gRPC,
 		})
 		if err != nil {
 			log.Errorf("failed to start observer. Error=%s", err.Error())
 		}
 	}()
+	time.Sleep(2 * time.Second)
 	return nil
 }
 

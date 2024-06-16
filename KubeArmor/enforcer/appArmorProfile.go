@@ -32,7 +32,7 @@ func (ae *AppArmorEnforcer) ResolvedProcessWhiteListConflicts(prof *Profile) {
 
 // SetProcessMatchPaths Function
 func (ae *AppArmorEnforcer) SetProcessMatchPaths(path tp.ProcessPathType, prof *Profile, deny bool, head bool) {
-	if deny == false {
+	if !deny {
 		prof.File = head
 	}
 	rule := RuleConfig{}
@@ -41,8 +41,11 @@ func (ae *AppArmorEnforcer) SetProcessMatchPaths(path tp.ProcessPathType, prof *
 	rule.OwnerOnly = path.OwnerOnly
 
 	if len(path.FromSource) == 0 {
+		if len(path.ExecName) > 0 {
+			addRuletoMap(rule, "/**/"+path.ExecName, prof.ProcessPaths)
+			return
+		}
 		addRuletoMap(rule, path.Path, prof.ProcessPaths)
-
 		return
 	}
 
@@ -58,11 +61,15 @@ func (ae *AppArmorEnforcer) SetProcessMatchPaths(path tp.ProcessPathType, prof *
 			fromsource.Rules.Init()
 			prof.FromSource[source] = fromsource
 		}
-		if deny == false {
+		if !deny {
 			if val, ok := prof.FromSource[source]; ok {
 				val.File = head
 				prof.FromSource[source] = val
 			}
+		}
+		if len(path.ExecName) > 0 {
+			addRuletoMap(rule, "/**/"+path.ExecName, prof.FromSource[source].ProcessPaths)
+			continue
 		}
 		addRuletoMap(rule, path.Path, prof.FromSource[source].ProcessPaths)
 	}
@@ -295,13 +302,17 @@ func (ae *AppArmorEnforcer) SetCapabilitiesMatchCapabilities(cap tp.Capabilities
 // == //
 
 // GenerateProfileBody Function
-func (ae *AppArmorEnforcer) GenerateProfileBody(securityPolicies []tp.SecurityPolicy, defaultPosture tp.DefaultPosture) (int, Profile) {
+func (ae *AppArmorEnforcer) GenerateProfileBody(securityPolicies []tp.SecurityPolicy, defaultPosture tp.DefaultPosture, privileged bool) (int, Profile) {
 	// preparation
 
 	count := 0
 
 	var profile Profile
 	profile.Init()
+
+	if privileged {
+		profile.Privileged = true
+	}
 
 	for _, secPolicy := range securityPolicies {
 		if len(secPolicy.Spec.AppArmor) > 0 {
@@ -449,7 +460,7 @@ func (ae *AppArmorEnforcer) GenerateProfileBody(securityPolicies []tp.SecurityPo
 // == //
 
 // GenerateAppArmorProfile Function
-func (ae *AppArmorEnforcer) GenerateAppArmorProfile(appArmorProfile string, securityPolicies []tp.SecurityPolicy, defaultPosture tp.DefaultPosture) (int, string, bool) {
+func (ae *AppArmorEnforcer) GenerateAppArmorProfile(appArmorProfile string, securityPolicies []tp.SecurityPolicy, defaultPosture tp.DefaultPosture, privileged bool) (int, string, bool) {
 	// check apparmor profile
 
 	if _, err := os.Stat(filepath.Clean("/etc/apparmor.d/" + appArmorProfile)); os.IsNotExist(err) {
@@ -466,7 +477,7 @@ func (ae *AppArmorEnforcer) GenerateAppArmorProfile(appArmorProfile string, secu
 
 	// generate a profile body
 
-	count, newProfile := ae.GenerateProfileBody(securityPolicies, defaultPosture)
+	count, newProfile := ae.GenerateProfileBody(securityPolicies, defaultPosture, privileged)
 
 	newProfile.Name = appArmorProfile
 

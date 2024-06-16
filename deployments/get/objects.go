@@ -52,6 +52,11 @@ func GetClusterRole() *rbacv1.ClusterRole {
 				Verbs:     []string{"get", "patch", "list", "watch", "update"},
 			},
 			{
+				APIGroups: []string{"batch"},
+				Resources: []string{"jobs", "cronjobs"},
+				Verbs:     []string{"get"},
+			},
+			{
 				APIGroups: []string{"security.kubearmor.com"},
 				Resources: []string{"kubearmorpolicies", "kubearmorhostpolicies"},
 				Verbs:     []string{"get", "list", "watch", "update", "delete"},
@@ -119,6 +124,20 @@ var replicas = int32(1)
 var relayDeploymentLabels = map[string]string{
 	"kubearmor-app": "kubearmor-relay",
 }
+var envVars = []corev1.EnvVar{
+	{
+		Name:  "ENABLE_STDOUT_LOGS",
+		Value: "false",
+	},
+	{
+		Name:  "ENABLE_STDOUT_ALERTS",
+		Value: "false",
+	},
+	{
+		Name:  "ENABLE_STDOUT_MSGS",
+		Value: "false",
+	},
+}
 
 // GetRelayDeployment Function
 func GetRelayDeployment(namespace string) *appsv1.Deployment {
@@ -145,7 +164,7 @@ func GetRelayDeployment(namespace string) *appsv1.Deployment {
 					Labels: relayDeploymentLabels,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: kubearmor,
+					ServiceAccountName: RelayServiceAccountName,
 					NodeSelector: map[string]string{
 						"kubernetes.io/os": "linux",
 					},
@@ -159,9 +178,69 @@ func GetRelayDeployment(namespace string) *appsv1.Deployment {
 									ContainerPort: port,
 								},
 							},
+							Env: envVars,
 						},
 					},
 				},
+			},
+		},
+	}
+}
+
+// GetRelayServiceAccount Function
+func GetRelayServiceAccount(namespace string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ServiceAccount",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      RelayServiceAccountName,
+			Namespace: namespace,
+		},
+	}
+}
+
+// GetRelayClusterRole Function
+func GetRelayClusterRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRole",
+			APIVersion: "rbac.authorization.k8s.io/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: RelayClusterRoleName,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"get", "list"},
+			},
+		},
+	}
+}
+
+// GetRelayClusterRoleBinding Function
+func GetRelayClusterRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRoleBinding",
+			APIVersion: "rbac.authorization.k8s.io/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: RelayClusterRoleBindingName,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     RelayClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      RelayServiceAccountName,
+				Namespace: namespace,
 			},
 		},
 	}
@@ -176,7 +255,7 @@ func GenerateDaemonSet(env, namespace string) *appsv1.DaemonSet {
 		"kubearmor-app": kubearmor,
 	}
 	var privileged = bool(false)
-	var terminationGracePeriodSeconds = int64(30)
+	var terminationGracePeriodSeconds = int64(60)
 	var args = []string{
 		"-gRPC=" + strconv.Itoa(int(port)),
 	}
@@ -489,7 +568,7 @@ func GetKubeArmorControllerDeployment(namespace string) *appsv1.Deployment {
 					Containers: []corev1.Container{
 						{
 							Name:  "kube-rbac-proxy",
-							Image: "gcr.io/kubebuilder/kube-rbac-proxy:v0.8.0",
+							Image: "gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0",
 							Args: []string{
 								"--secure-listen-address=0.0.0.0:8443",
 								"--upstream=http://127.0.0.1:8080/",
@@ -912,6 +991,7 @@ func GetKubearmorConfigMap(namespace, name string) *corev1.ConfigMap {
 	data[cfg.ConfigDefaultFilePosture] = "audit"
 	data[cfg.ConfigDefaultCapabilitiesPosture] = "audit"
 	data[cfg.ConfigDefaultNetworkPosture] = "audit"
+	data[cfg.ConfigDefaultPostureLogs] = "true"
 
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{

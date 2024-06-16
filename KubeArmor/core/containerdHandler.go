@@ -12,15 +12,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/typeurl/v2"
+
+	"golang.org/x/exp/slices"
+
+	"github.com/kubearmor/KubeArmor/KubeArmor/common"
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
+	"github.com/kubearmor/KubeArmor/KubeArmor/state"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 
 	pb "github.com/containerd/containerd/api/services/containers/v1"
 	pt "github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/typeurl/v2"
 	"google.golang.org/grpc"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -29,6 +34,26 @@ import (
 // ======================== //
 // == Containerd Handler == //
 // ======================== //
+
+// DefaultCaps contains all the default capabilities given to a
+// container by containerd runtime
+// Taken from - https://github.com/containerd/containerd/blob/main/oci/spec.go
+var defaultCaps = []string{
+	"CAP_CHOWN",
+	"CAP_DAC_OVERRIDE",
+	"CAP_FSETID",
+	"CAP_FOWNER",
+	"CAP_MKNOD",
+	"CAP_NET_RAW",
+	"CAP_SETGID",
+	"CAP_SETUID",
+	"CAP_SETFCAP",
+	"CAP_SETPCAP",
+	"CAP_NET_BIND_SERVICE",
+	"CAP_SYS_CHROOT",
+	"CAP_KILL",
+	"CAP_AUDIT_WRITE",
+}
 
 // Containerd Handler
 var Containerd *ContainerdHandler
@@ -60,9 +85,6 @@ type ContainerdHandler struct {
 	containerd context.Context
 	docker     context.Context
 
-	// storage path
-	StoragePath string
-
 	// active containers
 	containers map[string]context.Context
 }
@@ -70,14 +92,6 @@ type ContainerdHandler struct {
 // NewContainerdHandler Function
 func NewContainerdHandler() *ContainerdHandler {
 	ch := &ContainerdHandler{}
-
-	if strings.Contains(cfg.GlobalCfg.CRISocket, "microk8s") { // microk8s
-		ch.StoragePath = "/var/snap/microk8s/common/run/containerd"
-	} else if strings.Contains(cfg.GlobalCfg.CRISocket, "k3s") { // k3s
-		ch.StoragePath = "/run/k3s/containerd"
-	} else { // vanilla containerd
-		ch.StoragePath = "/run/containerd"
-	}
 
 	conn, err := grpc.Dial(cfg.GlobalCfg.CRISocket, grpc.WithInsecure())
 	if err != nil {
@@ -120,7 +134,7 @@ func (ch *ContainerdHandler) Close() {
 // ==================== //
 
 // GetContainerInfo Function
-func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID string) (tp.Container, error) {
+func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID string, OwnerInfo map[string]tp.PodOwner) (tp.Container, error) {
 	req := pb.GetContainerRequest{ID: containerID}
 	res, err := ch.client.Get(ctx, &req)
 	if err != nil {
@@ -144,6 +158,16 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 		if val, ok := containerLabels["io.kubernetes.pod.name"]; ok {
 			container.EndPointName = val
 		}
+	} else if val, ok := containerLabels["kubearmor.io/namespace"]; ok {
+		container.NamespaceName = val
+	} else {
+		container.NamespaceName = "container_namespace"
+	}
+
+	if len(OwnerInfo) > 0 {
+		if podOwnerInfo, ok := OwnerInfo[container.EndPointName]; ok {
+			container.Owner = podOwnerInfo
+		}
 	}
 
 	iface, err := typeurl.UnmarshalAny(res.Container.Spec)
@@ -154,12 +178,9 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 	spec := iface.(*specs.Spec)
 	container.AppArmorProfile = spec.Process.ApparmorProfile
 
-	if spec.Root.Path == "rootfs" { // containerd
-		preMergedDir := ch.StoragePath + "/io.containerd.runtime.v2.task/k8s.io/"
-		postMergedDir := "/rootfs"
-		container.MergedDir = preMergedDir + container.ContainerID + postMergedDir
-	} else { // docker
-		container.MergedDir = spec.Root.Path
+	// if a container has additional caps than default, we mark it as privileged
+	if spec.Process.Capabilities != nil && slices.Compare(spec.Process.Capabilities.Permitted, defaultCaps) >= 0 {
+		container.Privileged = true
 	}
 
 	// == //
@@ -189,6 +210,30 @@ func (ch *ContainerdHandler) GetContainerInfo(ctx context.Context, containerID s
 
 	// == //
 
+	if !cfg.GlobalCfg.K8sEnv {
+		container.ContainerImage = res.Container.Image //+ kl.GetSHA256ofImage(inspect.Image)
+
+		container.NodeName = cfg.GlobalCfg.Host
+
+		labels := []string{}
+		for k, v := range res.Container.Labels {
+			labels = append(labels, k+"="+v)
+		}
+		for k, v := range spec.Annotations {
+			labels = append(labels, k+"="+v)
+		}
+
+		// for policy matching
+		labels = append(labels, "namespaceName="+container.NamespaceName)
+		if _, ok := containerLabels["kubearmor.io/container.name"]; !ok {
+			labels = append(labels, "kubearmor.io/container.name="+container.ContainerName)
+		}
+
+		container.Labels = strings.Join(labels, ",")
+	}
+
+	// == //
+
 	return container, nil
 }
 
@@ -202,13 +247,13 @@ func (ch *ContainerdHandler) GetContainerdContainers() map[string]context.Contex
 
 	req := pb.ListContainersRequest{}
 
-	if containerList, err := ch.client.List(ch.docker, &req); err == nil {
+	if containerList, err := ch.client.List(ch.docker, &req, grpc.MaxCallRecvMsgSize(kl.DefaultMaxRecvMaxSize)); err == nil {
 		for _, container := range containerList.Containers {
 			containers[container.ID] = ch.docker
 		}
 	}
 
-	if containerList, err := ch.client.List(ch.containerd, &req); err == nil {
+	if containerList, err := ch.client.List(ch.containerd, &req, grpc.MaxCallRecvMsgSize(kl.DefaultMaxRecvMaxSize)); err == nil {
 		for _, container := range containerList.Containers {
 			containers[container.ID] = ch.containerd
 		}
@@ -255,7 +300,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 
 	if action == "start" {
 		// get container information from containerd client
-		container, err := Containerd.GetContainerInfo(ctx, containerID)
+		container, err := Containerd.GetContainerInfo(ctx, containerID, dm.OwnerInfo)
 		if err != nil {
 			return false
 		}
@@ -264,10 +309,89 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			return false
 		}
 
+		endPoint := tp.EndPoint{}
+
 		dm.ContainersLock.Lock()
 		if _, ok := dm.Containers[container.ContainerID]; !ok {
 			dm.Containers[container.ContainerID] = container
 			dm.ContainersLock.Unlock()
+
+			// create/update endPoint in non-k8s mode
+			if !dm.K8sEnabled {
+				endPointEvent := "ADDED"
+				endPointIdx := -1
+
+				containerLabels, containerIdentities := common.GetLabelsFromString(container.Labels)
+
+				dm.EndPointsLock.Lock()
+				// if a named endPoint exists we update
+				for idx, ep := range dm.EndPoints {
+					if container.ContainerName == ep.EndPointName || kl.MatchIdentities(ep.Identities, containerIdentities) {
+						endPointEvent = "UPDATED"
+						endPointIdx = idx
+						endPoint = ep
+						break
+					}
+				}
+
+				switch endPointEvent {
+				case "ADDED":
+					endPoint.EndPointName = container.ContainerName
+					endPoint.ContainerName = container.ContainerName
+					endPoint.NamespaceName = container.NamespaceName
+
+					endPoint.Containers = []string{container.ContainerID}
+
+					endPoint.Labels = containerLabels
+					endPoint.Identities = containerIdentities
+
+					endPoint.PolicyEnabled = tp.KubeArmorPolicyEnabled
+					endPoint.ProcessVisibilityEnabled = true
+					endPoint.FileVisibilityEnabled = true
+					endPoint.NetworkVisibilityEnabled = true
+					endPoint.CapabilitiesVisibilityEnabled = true
+
+					endPoint.AppArmorProfiles = []string{"kubearmor_" + container.ContainerName}
+
+					globalDefaultPosture := tp.DefaultPosture{
+						FileAction:         cfg.GlobalCfg.DefaultFilePosture,
+						NetworkAction:      cfg.GlobalCfg.DefaultNetworkPosture,
+						CapabilitiesAction: cfg.GlobalCfg.DefaultCapabilitiesPosture,
+					}
+					endPoint.DefaultPosture = globalDefaultPosture
+
+					dm.SecurityPoliciesLock.RLock()
+					for _, secPol := range dm.SecurityPolicies {
+						if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+							endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
+						}
+					}
+					dm.SecurityPoliciesLock.RUnlock()
+
+					dm.EndPoints = append(dm.EndPoints, endPoint)
+				case "UPDATED":
+					// in case of AppArmor enforcement when endPoint has to be created first
+					endPoint.Containers = append(endPoint.Containers, container.ContainerID)
+
+					// if this container has any additional identities, add them
+					endPoint.Identities = append(endPoint.Identities, containerIdentities...)
+					endPoint.Identities = slices.Compact(endPoint.Identities)
+
+					// add other policies
+					endPoint.SecurityPolicies = []tp.SecurityPolicy{}
+					dm.SecurityPoliciesLock.RLock()
+					for _, secPol := range dm.SecurityPolicies {
+						if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+							endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
+						}
+					}
+					dm.SecurityPoliciesLock.RUnlock()
+
+					dm.EndPoints[endPointIdx] = endPoint
+				}
+				dm.EndPointsLock.Unlock()
+			}
+
 		} else if dm.Containers[container.ContainerID].PidNS == 0 && dm.Containers[container.ContainerID].MntNS == 0 {
 			// this entry was updated by kubernetes before docker detects it
 			// thus, we here use the info given by kubernetes instead of the info given by docker
@@ -293,7 +417,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			for idx, endPoint := range dm.EndPoints {
 				if endPoint.NamespaceName == container.NamespaceName && endPoint.EndPointName == container.EndPointName && kl.ContainsElement(endPoint.Containers, container.ContainerID) {
 					// update containers
-					if !kl.ContainsElement(endPoint.Containers, container.ContainerID) {
+					if !kl.ContainsElement(endPoint.Containers, container.ContainerID) { // does not make sense but need to verify
 						dm.EndPoints[idx].Containers = append(dm.EndPoints[idx].Containers, container.ContainerID)
 					}
 
@@ -301,6 +425,26 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 					if !kl.ContainsElement(endPoint.AppArmorProfiles, container.AppArmorProfile) {
 						dm.EndPoints[idx].AppArmorProfiles = append(dm.EndPoints[idx].AppArmorProfiles, container.AppArmorProfile)
 					}
+
+					if container.Privileged && dm.EndPoints[idx].PrivilegedContainers != nil {
+						dm.EndPoints[idx].PrivilegedContainers[container.ContainerName] = struct{}{}
+					}
+
+					// add identities and labels if non-k8s
+					if !dm.K8sEnabled {
+						labelsSlice := strings.Split(container.Labels, ",")
+						for _, label := range labelsSlice {
+							key, value, ok := strings.Cut(label, "=")
+							if !ok {
+								continue
+							}
+
+							endPoint.Labels[key] = value
+							endPoint.Identities = append(endPoint.Identities, key+"="+value)
+						}
+					}
+
+					endPoint = dm.EndPoints[idx]
 
 					break
 				}
@@ -315,14 +459,19 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+
+			if len(endPoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endPoint yet
+				dm.Logger.UpdateSecurityPolicies("ADDED", endPoint)
+				if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+				}
+			}
 		}
 
-		if !dm.K8sEnabled {
-			dm.ContainersLock.Lock()
-			dm.EndPointsLock.Lock()
-			dm.MatchandUpdateContainerSecurityPolicies(containerID)
-			dm.EndPointsLock.Unlock()
-			dm.ContainersLock.Unlock()
+		if cfg.GlobalCfg.StateAgent {
+			container.Status = "running"
+			go dm.StateAgent.PushContainerEvent(container, state.EventAdded)
 		}
 
 		dm.Logger.Printf("Detected a container (added/%.12s/pidns=%d/mntns=%d)", containerID, container.PidNS, container.MntNS)
@@ -341,6 +490,22 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 		}
 		delete(dm.Containers, containerID)
 		dm.ContainersLock.Unlock()
+
+		// delete endpoint if no security rules and containers
+		if !dm.K8sEnabled {
+			idx := 0
+			endpointsLength := len(dm.EndPoints)
+			for idx < endpointsLength {
+				endpoint := dm.EndPoints[idx]
+				if container.NamespaceName == endpoint.NamespaceName && container.ContainerName == endpoint.EndPointName &&
+					len(endpoint.SecurityPolicies) == 0 && len(endpoint.Containers) == 0 {
+					dm.EndPoints = append(dm.EndPoints[:idx], dm.EndPoints[idx+1:]...)
+					endpointsLength--
+					idx--
+				}
+				idx++
+			}
+		}
 
 		dm.EndPointsLock.Lock()
 		for idx, endPoint := range dm.EndPoints {
@@ -363,6 +528,11 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 			// update NsMap
 			dm.SystemMonitor.DeleteContainerIDFromNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.UnregisterContainer(containerID)
+		}
+
+		if cfg.GlobalCfg.StateAgent {
+			container.Status = "terminated"
+			go dm.StateAgent.PushContainerEvent(container, state.EventDeleted)
 		}
 
 		dm.Logger.Printf("Detected a container (removed/%.12s/pidns=%d/mntns=%d)", containerID, container.PidNS, container.MntNS)

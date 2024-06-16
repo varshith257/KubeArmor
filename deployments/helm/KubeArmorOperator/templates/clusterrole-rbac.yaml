@@ -21,7 +21,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - secrets
   - serviceaccounts
   - services
   - configmaps
@@ -124,6 +123,13 @@ rules:
   - watch
   - update
 - apiGroups:
+  - batch
+  resources:
+  - jobs
+  - cronjobs
+  verbs:
+  - get
+- apiGroups:
   - security.kubearmor.com
   resources:
   - kubearmorpolicies
@@ -214,4 +220,32 @@ rules:
 - nonResourceURLs:
   - /metrics
   verbs:
-  - get  
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.kubearmorOperator.name }}-tls-secrets-role
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - update
+  - delete
+  resourceNames:
+  - {{ .Values.tlsSecrets.kubearmorCa }}
+  - {{ .Values.tlsSecrets.kubearmorClient }}
+  - {{ .Values.tlsSecrets.relayServer }}
+  - {{ .Values.tlsSecrets.controllerWebhook }}
+# cannot restric create by resource name, https://kubernetes.io/docs/reference/access-authn-authz/rbac/  
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+---

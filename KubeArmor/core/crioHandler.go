@@ -77,7 +77,7 @@ func (ch *CrioHandler) Close() {
 // ==================== //
 
 // GetContainerInfo Function gets info of a particular container
-func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string) (tp.Container, error) {
+func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string, OwnerInfo map[string]tp.PodOwner) (tp.Container, error) {
 	// request to get status of specified container
 	// verbose has to be true to retrieve additional CRI specific info
 	req := &pb.ContainerStatusRequest{
@@ -110,6 +110,12 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string)
 		container.EndPointName = val
 	}
 
+	if len(OwnerInfo) > 0 {
+		if podOwnerInfo, ok := OwnerInfo[container.EndPointName]; ok {
+			container.Owner = podOwnerInfo
+		}
+	}
+
 	// extracting the runtime specific "info"
 	var containerInfo CrioContainerInfo
 	err = json.Unmarshal([]byte(res.Info["info"]), &containerInfo)
@@ -119,9 +125,7 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string)
 
 	// path to container's root storage
 	container.AppArmorProfile = containerInfo.RuntimeSpec.Process.ApparmorProfile
-
-	// path to the rootfs
-	container.MergedDir = containerInfo.RuntimeSpec.Root.Path
+	container.Privileged = containerInfo.Privileged
 
 	pid := strconv.Itoa(containerInfo.Pid)
 
@@ -155,7 +159,7 @@ func (ch *CrioHandler) GetCrioContainers() (map[string]struct{}, error) {
 
 	req := pb.ListContainersRequest{}
 
-	if containerList, err := ch.client.ListContainers(context.Background(), &req); err == nil {
+	if containerList, err := ch.client.ListContainers(context.Background(), &req, grpc.MaxCallRecvMsgSize(kl.DefaultMaxRecvMaxSize)); err == nil {
 		for _, container := range containerList.Containers {
 			containers[container.Id] = struct{}{}
 		}
@@ -203,7 +207,7 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 
 	if action == "start" {
 		// get container info from client
-		container, err := Crio.GetContainerInfo(ctx, containerID)
+		container, err := Crio.GetContainerInfo(ctx, containerID, dm.OwnerInfo)
 		if err != nil {
 			return false
 		}
@@ -211,6 +215,8 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 		if container.ContainerID == "" {
 			return false
 		}
+
+		endpoint := tp.EndPoint{}
 
 		dm.ContainersLock.Lock()
 		if _, ok := dm.Containers[container.ContainerID]; !ok {
@@ -243,6 +249,12 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 						dm.EndPoints[idx].AppArmorProfiles = append(dm.EndPoints[idx].AppArmorProfiles, container.AppArmorProfile)
 					}
 
+					if container.Privileged && dm.EndPoints[idx].PrivilegedContainers != nil {
+						dm.EndPoints[idx].PrivilegedContainers[container.ContainerName] = struct{}{}
+					}
+
+					endpoint = dm.EndPoints[idx]
+
 					break
 				}
 			}
@@ -256,6 +268,14 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+
+			if len(endpoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
+				dm.Logger.UpdateSecurityPolicies("ADDED", endpoint)
+				if dm.RuntimeEnforcer != nil && endpoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(endpoint)
+				}
+			}
 		}
 
 		if !dm.K8sEnabled {

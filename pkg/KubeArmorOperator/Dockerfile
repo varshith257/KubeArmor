@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2022 Authors of KubeArmor
 
-FROM docker.io/golang:1.20 as builder
+FROM docker.io/golang:1.22 as builder
 ARG GOARCH
 ARG GOOS
 
@@ -29,10 +29,12 @@ COPY $OPERATOR_DIR/api api
 COPY $OPERATOR_DIR/client client
 COPY $OPERATOR_DIR/cmd cmd
 COPY $OPERATOR_DIR/common common
+COPY $OPERATOR_DIR/cert cert
 COPY $OPERATOR_DIR/internal/controller internal/controller
 COPY $OPERATOR_DIR/enforcer enforcer
 COPY $OPERATOR_DIR/k8s k8s
 COPY $OPERATOR_DIR/runtime runtime
+COPY $OPERATOR_DIR/seccomp seccomp
 
 # Build
 RUN CGO_ENABLED=0 GOOS=${GOOS} GOARCH=${GOARCH} GO111MODULE=on go build -a -o operator cmd/operator/main.go

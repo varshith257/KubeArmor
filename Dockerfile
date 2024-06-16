@@ -3,7 +3,7 @@
 
 ### Builder
 
-FROM golang:1.20-alpine3.17 as builder
+FROM golang:1.22-alpine3.19 as builder
 
 RUN apk --no-cache update
 RUN apk add --no-cache git clang llvm make gcc protobuf
@@ -20,7 +20,7 @@ RUN make
 
 ### Make executable image
 
-FROM alpine:3.17 as kubearmor
+FROM alpine:3.18 as kubearmor
 
 RUN echo "@community http://dl-cdn.alpinelinux.org/alpine/edge/community" | tee -a /etc/apk/repositories
 
@@ -66,7 +66,7 @@ RUN groupadd --gid 1000 default \
   && useradd --uid 1000 --gid default --shell /bin/bash --create-home default
 
 COPY LICENSE /licenses/license.txt
-COPY --from=builder --chown=default:dafault /usr/src/KubeArmor/KubeArmor/kubearmor /KubeArmor/kubearmor
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/KubeArmor/kubearmor /KubeArmor/kubearmor
 COPY --from=builder --chown=default:default /usr/src/KubeArmor/KubeArmor/templates/* /KubeArmor/templates/
 
 # TODO

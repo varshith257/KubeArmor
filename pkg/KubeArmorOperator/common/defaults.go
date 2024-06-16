@@ -41,14 +41,21 @@ const (
 var OperatorConfigCrd *opv1.KubeArmorConfig
 
 var (
-	EnforcerLabel           string = "kubearmor.io/enforcer"
-	RuntimeLabel            string = "kubearmor.io/runtime"
-	RuntimeStorageLabel     string = "kubearmor.io/runtime-storage"
-	SocketLabel             string = "kubearmor.io/socket"
-	RandLabel               string = "kubearmor.io/rand"
-	OsLabel                 string = "kubernetes.io/os"
-	ArchLabel               string = "kubernetes.io/arch"
-	BTFLabel                string = "kubearmor.io/btf"
+	// node labels
+	EnforcerLabel   string = "kubearmor.io/enforcer"
+	RuntimeLabel    string = "kubearmor.io/runtime"
+	SocketLabel     string = "kubearmor.io/socket"
+	RandLabel       string = "kubearmor.io/rand"
+	OsLabel         string = "kubernetes.io/os"
+	ArchLabel       string = "kubernetes.io/arch"
+	BTFLabel        string = "kubearmor.io/btf"
+	ApparmorFsLabel string = "kubearmor.io/apparmorfs"
+	SecurityFsLabel string = "kubearmor.io/securityfs"
+	SeccompLabel    string = "kubearmor.io/seccomp"
+
+	// if any node with securityfs/lsm present
+	IfNodeWithSecurtiyFs bool = false
+
 	DeleteAction            string = "DELETE"
 	AddAction               string = "ADD"
 	Namespace               string = "kubearmor"
@@ -68,6 +75,13 @@ var (
 	ConfigDefaultFilePosture         string = "defaultFilePosture"
 	ConfigDefaultCapabilitiesPosture string = "defaultCapabilitiesPosture"
 	ConfigDefaultNetworkPosture      string = "defaultNetworkPosture"
+	ConfigDefaultPostureLogs         string = "defaultPostureLogs"
+
+	//KubearmorRelayEnvVariables
+
+	EnableStdOutAlerts string = "enableStdOutAlerts"
+	EnableStdOutLogs   string = "enableStdOutLogs"
+	EnableStdOutMsgs   string = "enableStdOutMsgs"
 
 	// Images
 	KubeArmorName                      string = "kubearmor"
@@ -83,8 +97,20 @@ var (
 	KubeArmorControllerImage           string = "kubearmor/kubearmor-controller:latest"
 	KubeArmorControllerImagePullPolicy string = "Always"
 	KubeRbacProxyName                  string = "kube-rbac-proxy"
-	KubeRbacProxyImage                 string = "gcr.io/kubebuilder/kube-rbac-proxy:v0.12.0"
+	KubeRbacProxyImage                 string = "gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0"
 	KubeRbacProxyImagePullPolicy       string = "Always"
+	SeccompProfile                            = "kubearmor-seccomp.json"
+	SeccompInitProfile                        = "kubearmor-init-seccomp.json"
+
+	// tls
+	EnableTls                      bool     = false
+	ExtraDnsNames                  []string = []string{"localhost"}
+	ExtraIpAddresses               []string = []string{"127.0.0.1"}
+	KubeArmorCaSecretName          string   = "kubearmor-ca"
+	KubeArmorClientSecretName      string   = "kubearmor-client-certs"
+	KubeArmorRelayServerSecretName string   = "kubearmor-relay-server-certs"
+	DefaultTlsCertPath             string   = "/var/lib/kubearmor/tls"
+	DefaultMode                    int32    = 420 // deciaml representation of octal value 644
 )
 
 var ConfigMapData = map[string]string{
@@ -94,10 +120,21 @@ var ConfigMapData = map[string]string{
 	ConfigDefaultCapabilitiesPosture: "audit",
 	ConfigDefaultNetworkPosture:      "audit",
 	ConfigVisibility:                 "process,network,capabilities",
+	ConfigDefaultPostureLogs:         "true",
+}
+
+var ConfigDefaultSeccompEnabled = "false"
+
+var KubearmorRelayEnvMap = map[string]string{
+	EnableStdOutAlerts: "false",
+	EnableStdOutLogs:   "false",
+	EnableStdOutMsgs:   "false",
 }
 
 var ContainerRuntimeSocketMap = map[string][]string{
 	"docker": {
+		"/run/containerd/containerd.sock",
+		"/var/run/containerd/containerd.sock",
 		"/var/run/docker.sock",
 		"/run/docker.sock",
 	},
@@ -118,7 +155,6 @@ var ContainerRuntimeSocketMap = map[string][]string{
 var HostPathDirectory = corev1.HostPathDirectory
 var HostPathSocket = corev1.HostPathSocket
 var HostPathFile = corev1.HostPathFile
-var HostToContainerMountPropagation = corev1.MountPropagationHostToContainer
 
 var EnforcerVolumesMounts = map[string][]corev1.VolumeMount{
 	"apparmor": {
@@ -159,26 +195,6 @@ var EnforcerVolumes = map[string][]corev1.Volume{
 			},
 		},
 	},
-}
-
-var RuntimeStorageVolumes = map[string][]string{
-	"docker": {
-		"/var/lib/docker",
-	},
-	"cri-o": {
-		"/var/lib/containers/storage",
-	},
-	"containerd": {
-		"/run/k0s/containerd",
-		"/run/k3s/containerd",
-		"/run/containerd",
-	},
-}
-
-var RuntimeStorageLocation = map[string]string{
-	"docker":     "/var/lib/docker",
-	"containerd": "/run/containerd",
-	"cri-o":      "/var/lib/containers/storage",
 }
 
 var RuntimeSocketLocation = map[string]string{
@@ -235,6 +251,95 @@ var CommonVolumesMount = []corev1.VolumeMount{
 	{
 		Name:      "os-release-path",
 		MountPath: "/media/root/etc/os-release",
+		ReadOnly:  true,
+	},
+}
+
+var KubeArmorCaVolume = []corev1.Volume{
+	{
+		Name: "kubearmor-ca-secret",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: KubeArmorCaSecretName,
+				Items: []corev1.KeyToPath{
+					{
+						Key:  "tls.crt",
+						Path: "ca.crt",
+					},
+					{
+						Key:  "tls.key",
+						Path: "ca.key",
+					},
+				},
+				DefaultMode: &DefaultMode,
+			},
+		},
+	},
+}
+
+var KubeArmorCaVolumeMount = []corev1.VolumeMount{
+	{
+		Name:      "kubearmor-ca-secret",
+		MountPath: DefaultTlsCertPath,
+		ReadOnly:  true,
+	},
+}
+
+var KubeArmorRelayTlsVolume = []corev1.Volume{
+	{
+		Name: "kubearmor-relay-certs-secrets",
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{
+					{
+						Secret: &corev1.SecretProjection{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: KubeArmorClientSecretName,
+							},
+							Items: []corev1.KeyToPath{
+								{
+									Key:  "tls.crt",
+									Path: "client.crt",
+								},
+								{
+									Key:  "tls.key",
+									Path: "client.key",
+								},
+							},
+						},
+					},
+					{
+						Secret: &corev1.SecretProjection{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: KubeArmorRelayServerSecretName,
+							},
+							Items: []corev1.KeyToPath{
+								{
+									Key:  "tls.crt",
+									Path: "server.crt",
+								},
+								{
+									Key:  "tls.key",
+									Path: "server.key",
+								},
+								{
+									Key:  "ca.crt",
+									Path: "ca.crt",
+								},
+							},
+						},
+					},
+				},
+				DefaultMode: &DefaultMode,
+			},
+		},
+	},
+}
+
+var KubeArmorRelayTlsVolumeMount = []corev1.VolumeMount{
+	{
+		Name:      "kubearmor-relay-certs-secrets",
+		MountPath: DefaultTlsCertPath,
 		ReadOnly:  true,
 	},
 }
@@ -360,5 +465,51 @@ func init() {
 	Namespace = GetOperatorNamespace()
 	if IsCertifiedOperator() {
 		HostPID = true
+	}
+}
+
+func AddOrReplaceArg(add, replace string, args *[]string) {
+	added := false
+	for i, arg := range *args {
+		if arg == replace || arg == add {
+			(*args)[i] = add
+			added = true
+			break
+		}
+	}
+	if !added {
+		*args = append(*args, add)
+	}
+}
+
+func GetTlsState() bool {
+	return EnableTls
+}
+
+func AddOrRemoveVolumeMount(src *[]corev1.VolumeMount, dest *[]corev1.VolumeMount, action string) {
+	for i, mnt := range *dest {
+		for _, m := range *src {
+			if mnt.Name == m.Name {
+				(*dest)[i] = (*dest)[len(*dest)-1]
+				*dest = (*dest)[:len(*dest)-1]
+			}
+		}
+	}
+	if action == AddAction {
+		*dest = append(*dest, *src...)
+	}
+}
+
+func AddOrRemoveVolume(src *[]corev1.Volume, dest *[]corev1.Volume, action string) {
+	for i, mnt := range *dest {
+		for _, m := range *src {
+			if mnt.Name == m.Name {
+				(*dest)[i] = (*dest)[len(*dest)-1]
+				*dest = (*dest)[:len(*dest)-1]
+			}
+		}
+	}
+	if action == AddAction {
+		*dest = append(*dest, *src...)
 	}
 }

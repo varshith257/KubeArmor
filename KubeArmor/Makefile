@@ -50,12 +50,12 @@ run: build
 	cd $(CURDIR); sudo rm -f /tmp/kubearmor.log
 	cd $(CURDIR)/BPF; make clean
 	cd $(CURDIR)/BPF; make
-	cd $(CURDIR); sudo -E ./kubearmor -logPath=/tmp/kubearmor.log -enableKubeArmorPolicy -enableKubeArmorHostPolicy -hostVisibility=process,file,network,capabilities -defaultFilePosture block -defaultCapabilitiesPosture block -defaultNetworkPosture block -hostDefaultFilePosture block -hostDefaultCapabilitiesPosture block -hostDefaultNetworkPosture block
+	cd $(CURDIR); DEBUG=true sudo -E ./kubearmor -logPath=/tmp/kubearmor.log -enableKubeArmorPolicy -enableKubeArmorHostPolicy -hostVisibility=process,file,network,capabilities -defaultFilePosture block -defaultCapabilitiesPosture block -defaultNetworkPosture block -hostDefaultFilePosture block -hostDefaultCapabilitiesPosture block -hostDefaultNetworkPosture block
 
 .PHONY: run-container
 run-container: build
 	cd $(CURDIR); sudo rm -f /tmp/kubearmor.log
-	cd $(CURDIR); sudo -E ./kubearmor -logPath=/tmp/kubearmor.log -enableKubeArmorHostPolicy -enableKubeArmorPolicy -k8s=false
+	cd $(CURDIR); sudo -E ./kubearmor -logPath=/tmp/kubearmor.log -enableKubeArmorHostPolicy -enableKubeArmorPolicy -k8s=false -criSocket=unix:///var/run/docker.sock
 
 .PHONY: run-host-only
 run-host-only: build
@@ -123,26 +123,25 @@ ifeq (, $(shell which goreleaser))
 	}
 endif
 	cd $(CURDIR)/BPF; make clean
+	cd $(CURDIR)/BPF; make
 	cd $(CURDIR); curl -sfL https://raw.githubusercontent.com/kubearmor/kubearmor-client/main/install.sh | sh -s -- -b .
-	cd $(CURDIR); VERSION=$(shell git describe --tags --always --dirty) goreleaser release --rm-dist --skip-publish --skip-sign --skip-validate --snapshot
+	cd $(CURDIR); VERSION=$(shell git describe --tags --always --dirty) goreleaser release --clean --skip=publish,sign,validate --snapshot
 
 .PHONY: scan
 scan: 
 	go install golang.org/x/vuln/cmd/govulncheck@latest ;\
 	cd $(CURDIR);\
-	govulncheck -v ./... ;\
-	cd $(CURDIR)/BPF/tests;\
-	govulncheck -v ./... ;\
+	govulncheck ./... ;\
+	cd $(CURDIR)/../tests;\
+	govulncheck ./... ;\
+	cd $(CURDIR)/../protobuf;\
+	govulncheck ./... ;\
 	cd $(CURDIR)/../deployments;\
-	govulncheck -v ./... ;\
-	cd $(CURDIR)/../pkg/KubeArmorAnnotation ;\
-	govulncheck -v ./... ;\
+	govulncheck ./... ;\
 	cd $(CURDIR)/../pkg/KubeArmorController ;\
-	govulncheck -v ./... ;\
-	cd $(CURDIR)/../pkg/KubeArmorHostPolicy ;\
-	govulncheck -v ./... ;\
-	cd $(CURDIR)/../pkg/KubeArmorPolicy ;\
-	govulncheck -v ./... ;\
+	govulncheck ./... ;\
+	cd $(CURDIR)/../pkg/KubeArmorOperator;\
+	govulncheck ./... ;\
 
 .PHONY: clean
 clean:

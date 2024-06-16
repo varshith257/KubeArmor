@@ -23,6 +23,10 @@ spec:
     matchDirectories:
       - dir: /pts/
         recursive: true
+      - dir: /proc/
+        recursive: true
+      - dir: /dev/
+        recursive: true
       - dir: /lib/x86_64-linux-gnu/
       - dir: /bin/
   action:

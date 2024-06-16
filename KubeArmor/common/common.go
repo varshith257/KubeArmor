@@ -9,22 +9,35 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	kc "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ============ //
 // == Common == //
 // ============ //
+
+const (
+	// grpc default is 4MB
+	// CRI i.e. containerd service can send msg extended upto 16MB
+	// https://github.com/containerd/containerd/blob/main/defaults/defaults.go#L22-L25
+	DefaultMaxRecvMaxSize = 16 << 20
+)
 
 // Clone Function
 func Clone(src, dst interface{}) error {
@@ -51,6 +64,24 @@ func ContainsElement(slice interface{}, element interface{}) bool {
 		}
 	}
 	return false
+}
+
+// MatchesRegex function
+func MatchesRegex(key, element string, array []string) bool {
+	for _, item := range array {
+		if strings.Contains(item, key) {
+			expr, err := regexp.CompilePOSIX(element)
+			if err != nil {
+				kg.Warnf("Failed to compile regex: %s", element)
+				return false
+			}
+
+			return expr.MatchString(item)
+		}
+	}
+
+	// key not found in array
+	return true
 }
 
 // ObjCommaCanBeExpanded Function
@@ -375,6 +406,9 @@ func IsK8sEnv() bool {
 	return false
 }
 
+// ContainerRuntimeSocketKeys contains FIFO ordered keys of container runtimes
+var ContainerRuntimeSocketKeys = []string{"docker", "containerd", "cri-o"}
+
 // ContainerRuntimeSocketMap Structure
 var ContainerRuntimeSocketMap = map[string][]string{
 	"docker": {
@@ -396,7 +430,7 @@ var ContainerRuntimeSocketMap = map[string][]string{
 
 // GetCRISocket Function
 func GetCRISocket(ContainerRuntime string) string {
-	for k := range ContainerRuntimeSocketMap {
+	for _, k := range ContainerRuntimeSocketKeys {
 		if ContainerRuntime != "" && k != ContainerRuntime {
 			continue
 		}
@@ -434,6 +468,26 @@ func MatchIdentities(identities []string, superIdentities []string) bool {
 
 	// if super identities not include identity, return false
 	for _, identity := range identities {
+
+		// match regex if container name or host name label present
+		if strings.Contains(identity, "kubearmor.io/container.name") {
+			if !MatchesRegex("kubearmor.io/container.name", identity, superIdentities) {
+				matched = false
+				break
+			}
+
+			continue
+		}
+
+		if strings.Contains(identity, "kubearmor.io/hostname") {
+			if !MatchesRegex("kubearmor.io/hostname", identity, superIdentities) {
+				matched = false
+				break
+			}
+
+			continue
+		}
+
 		if !ContainsElement(superIdentities, identity) {
 			matched = false
 			break
@@ -455,4 +509,82 @@ func WriteToFile(val interface{}, destFile string) error {
 		return err
 	}
 	return nil
+}
+
+// ParseURL with/without scheme and return host, port or error
+func ParseURL(address string) (string, string, error) {
+	var host string
+	port := "80"
+
+	addr, err := url.Parse(address)
+	if err != nil || addr.Host == "" {
+		// URL without scheme
+		u, repErr := url.ParseRequestURI("http://" + address)
+		if repErr != nil {
+			return "", "", fmt.Errorf("Error while parsing URL: %s", err)
+		}
+
+		addr = u
+	}
+
+	host = addr.Hostname()
+	if addr.Port() != "" {
+		port = addr.Port()
+	}
+
+	return host, port, nil
+}
+
+// handle gRPC errors
+func HandleGRPCErrors(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if status, ok := status.FromError(err); ok {
+		switch status.Code() {
+		case codes.OK:
+			// noop
+			return nil
+		//case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
+		//	return status.Err()
+		default:
+			return status.Err()
+		}
+	}
+
+	return nil
+}
+
+// get boot time
+// credits: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/util/boottime_util_linux.go
+func GetBootTime() string {
+	currentTime := time.Now()
+
+	var info unix.Sysinfo_t
+	if err := unix.Sysinfo(&info); err != nil {
+		return ""
+	}
+
+	return currentTime.Add(-time.Duration(info.Uptime) * time.Second).Truncate(time.Second).UTC().String()
+}
+
+func GetLabelsFromString(labelString string) (map[string]string, []string) {
+	labelsMap := make(map[string]string)
+
+	labelsSlice := strings.Split(labelString, ",")
+	for _, label := range labelsSlice {
+		key, value, ok := strings.Cut(label, "=")
+		if !ok {
+			continue
+		}
+
+		labelsMap[key] = value
+	}
+
+	sort.Slice(labelsSlice, func(i, j int) bool {
+		return labelsSlice[i] < labelsSlice[j]
+	})
+
+	return labelsMap, labelsSlice
 }

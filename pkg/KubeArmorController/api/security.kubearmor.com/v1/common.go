@@ -11,6 +11,9 @@ type NodeSelectorType struct {
 	MatchLabels map[string]string `json:"matchLabels,omitempty"`
 }
 
+// +kubebuilder:validation:Pattern=^[^\/]+$
+type MatchBinType string
+
 // +kubebuilder:validation:Pattern=^\/+.*[^\/]$
 type MatchPathType string
 
@@ -25,7 +28,11 @@ type MatchSourceType struct {
 }
 
 type ProcessPathType struct {
-	Path MatchPathType `json:"path"`
+	// +kubebuilder:validation:Optional
+	Path MatchPathType `json:"path,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	ExecName MatchBinType `json:"execname,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	OwnerOnly bool `json:"ownerOnly,omitempty"`
@@ -206,7 +213,7 @@ type MatchHostNetworkProtocolType struct {
 }
 
 type NetworkType struct {
-	MatchProtocols []MatchNetworkProtocolType `json:"matchProtocols"`
+	MatchProtocols []MatchNetworkProtocolType `json:"matchProtocols,omitempty"`
 
 	// +kubebuilder:validation:optional
 	Severity SeverityType `json:"severity,omitempty"`
@@ -219,7 +226,7 @@ type NetworkType struct {
 }
 
 type HostNetworkType struct {
-	MatchProtocols []MatchHostNetworkProtocolType `json:"matchProtocols"`
+	MatchProtocols []MatchHostNetworkProtocolType `json:"matchProtocols,omitempty"`
 
 	// +kubebuilder:validation:optional
 	Severity SeverityType `json:"severity,omitempty"`
@@ -265,7 +272,7 @@ type MatchHostCapabilitiesType struct {
 }
 
 type CapabilitiesType struct {
-	MatchCapabilities []MatchCapabilitiesType `json:"matchCapabilities"`
+	MatchCapabilities []MatchCapabilitiesType `json:"matchCapabilities,omitempty"`
 
 	// +kubebuilder:validation:optional
 	Severity SeverityType `json:"severity,omitempty"`
@@ -278,7 +285,7 @@ type CapabilitiesType struct {
 }
 
 type HostCapabilitiesType struct {
-	MatchCapabilities []MatchHostCapabilitiesType `json:"matchCapabilities"`
+	MatchCapabilities []MatchHostCapabilitiesType `json:"matchCapabilities,omitempty"`
 
 	// +kubebuilder:validation:optional
 	Severity SeverityType `json:"severity,omitempty"`

@@ -8,16 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 
+	"github.com/kubearmor/KubeArmor/KubeArmor/common"
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
+	"github.com/kubearmor/KubeArmor/KubeArmor/state"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
@@ -37,6 +41,9 @@ type DockerVersion struct {
 type DockerHandler struct {
 	DockerClient *client.Client
 	Version      DockerVersion
+
+	// needed for container info
+	NodeIP string
 }
 
 // NewDockerHandler Function
@@ -65,6 +72,8 @@ func NewDockerHandler() (*DockerHandler, error) {
 
 	docker.DockerClient = DockerClient
 
+	docker.NodeIP = kl.GetExternalIPAddr()
+
 	kg.Printf("Initialized Docker Handler (version: %s)", clientVersion)
 
 	return docker, nil
@@ -84,7 +93,7 @@ func (dh *DockerHandler) Close() {
 // ==================== //
 
 // GetContainerInfo Function
-func (dh *DockerHandler) GetContainerInfo(containerID string) (tp.Container, error) {
+func (dh *DockerHandler) GetContainerInfo(containerID string, OwnerInfo map[string]tp.PodOwner) (tp.Container, error) {
 	if dh.DockerClient == nil {
 		return tp.Container{}, errors.New("no docker client")
 	}
@@ -104,7 +113,8 @@ func (dh *DockerHandler) GetContainerInfo(containerID string) (tp.Container, err
 	container.NamespaceName = "Unknown"
 	container.EndPointName = "Unknown"
 
-	containerLabels := inspect.Config.Labels
+	containerLabels := make(map[string]string)
+	containerLabels = inspect.Config.Labels
 	if _, ok := containerLabels["io.kubernetes.pod.namespace"]; ok { // kubernetes
 		if val, ok := containerLabels["io.kubernetes.pod.namespace"]; ok {
 			container.NamespaceName = val
@@ -112,11 +122,23 @@ func (dh *DockerHandler) GetContainerInfo(containerID string) (tp.Container, err
 		if val, ok := containerLabels["io.kubernetes.pod.name"]; ok {
 			container.EndPointName = val
 		}
+	} else if val, ok := containerLabels["kubearmor.io/namespace"]; ok {
+		container.NamespaceName = val
+	} else {
+		container.NamespaceName = "container_namespace"
+	}
+
+	if len(OwnerInfo) > 0 {
+		if podOwnerInfo, ok := OwnerInfo[container.EndPointName]; ok {
+			container.Owner = podOwnerInfo
+		}
 	}
 
 	container.AppArmorProfile = inspect.AppArmorProfile
-
-	container.MergedDir = inspect.GraphDriver.Data["MergedDir"]
+	if inspect.HostConfig.Privileged ||
+		(inspect.HostConfig.CapAdd != nil && len(inspect.HostConfig.CapAdd) > 0) {
+		container.Privileged = inspect.HostConfig.Privileged
+	}
 
 	// == //
 
@@ -135,6 +157,54 @@ func (dh *DockerHandler) GetContainerInfo(containerID string) (tp.Container, err
 	}
 
 	// == //
+
+	if !cfg.GlobalCfg.K8sEnv {
+		container.ContainerImage = inspect.Config.Image //+ kl.GetSHA256ofImage(inspect.Image)
+
+		container.NodeName = cfg.GlobalCfg.Host
+
+		labels := []string{}
+		for k, v := range containerLabels {
+			labels = append(labels, k+"="+v)
+		}
+
+		// for policy matching
+		labels = append(labels, "namespaceName="+container.NamespaceName)
+		if _, ok := containerLabels["kubearmor.io/container.name"]; !ok {
+			labels = append(labels, "kubearmor.io/container.name="+container.ContainerName)
+		}
+
+		container.Labels = strings.Join(labels, ",")
+
+		var podIP string
+		if inspect.HostConfig != nil {
+			if inspect.HostConfig.NetworkMode.IsNone() || inspect.HostConfig.NetworkMode.IsContainer() {
+				podIP = ""
+			} else if inspect.HostConfig.NetworkMode.IsHost() {
+				podIP = dh.NodeIP
+			} else {
+				// user defined network OR swarm mode
+				networkName := inspect.HostConfig.NetworkMode.NetworkName()
+				networkInfo, ok := inspect.NetworkSettings.Networks[networkName]
+				if ok && networkInfo != nil {
+					podIP = networkInfo.IPAddress
+				}
+			}
+		}
+		container.ContainerIP = podIP
+
+		// time format used by docker engine is RFC3339Nano
+		lastUpdatedAt, err := time.Parse(time.RFC3339Nano, inspect.State.StartedAt)
+		if err == nil {
+			container.LastUpdatedAt = lastUpdatedAt.UTC().String()
+		}
+		// finished at is IsZero until a container exits
+		timeFinished, err := time.Parse(time.RFC3339Nano, inspect.State.FinishedAt)
+		if err == nil && !timeFinished.IsZero() && timeFinished.After(lastUpdatedAt) {
+			lastUpdatedAt = timeFinished
+		}
+
+	}
 
 	return container, nil
 }
@@ -161,7 +231,7 @@ func (dh *DockerHandler) GetEventChannel() <-chan events.Message {
 func (dm *KubeArmorDaemon) SetContainerVisibility(containerID string) {
 
 	// get container information from docker client
-	container, err := Docker.GetContainerInfo(containerID)
+	container, err := Docker.GetContainerInfo(containerID, dm.OwnerInfo)
 	if err != nil {
 		return
 	}
@@ -199,7 +269,7 @@ func (dm *KubeArmorDaemon) GetAlreadyDeployedDockerContainers() {
 	if containerList, err := Docker.DockerClient.ContainerList(context.Background(), types.ContainerListOptions{}); err == nil {
 		for _, dcontainer := range containerList {
 			// get container information from docker client
-			container, err := Docker.GetContainerInfo(dcontainer.ID)
+			container, err := Docker.GetContainerInfo(dcontainer.ID, dm.OwnerInfo)
 			if err != nil {
 				continue
 			}
@@ -207,11 +277,91 @@ func (dm *KubeArmorDaemon) GetAlreadyDeployedDockerContainers() {
 			if container.ContainerID == "" {
 				continue
 			}
+
+			endPoint := tp.EndPoint{}
+
 			if dcontainer.State == "running" {
 				dm.ContainersLock.Lock()
 				if _, ok := dm.Containers[container.ContainerID]; !ok {
 					dm.Containers[container.ContainerID] = container
 					dm.ContainersLock.Unlock()
+
+					// create/update endpoint in non-k8s mode
+					if !dm.K8sEnabled {
+						endPointEvent := "ADDED"
+						endPointIdx := -1
+
+						containerLabels, containerIdentities := common.GetLabelsFromString(container.Labels)
+
+						dm.EndPointsLock.Lock()
+						// if a named endpoint exists we update
+						for idx, ep := range dm.EndPoints {
+							if container.ContainerName == ep.EndPointName || kl.MatchIdentities(ep.Identities, containerIdentities) {
+								endPointEvent = "UPDATED"
+								endPointIdx = idx
+								endPoint = ep
+								break
+							}
+						}
+
+						switch endPointEvent {
+						case "ADDED":
+							endPoint.EndPointName = container.ContainerName
+							endPoint.ContainerName = container.ContainerName
+							endPoint.NamespaceName = container.NamespaceName
+
+							endPoint.Containers = []string{container.ContainerID}
+
+							endPoint.Labels = containerLabels
+							endPoint.Identities = containerIdentities
+
+							endPoint.PolicyEnabled = tp.KubeArmorPolicyEnabled
+							endPoint.ProcessVisibilityEnabled = true
+							endPoint.FileVisibilityEnabled = true
+							endPoint.NetworkVisibilityEnabled = true
+							endPoint.CapabilitiesVisibilityEnabled = true
+
+							endPoint.AppArmorProfiles = []string{"kubearmor_" + container.ContainerName}
+
+							globalDefaultPosture := tp.DefaultPosture{
+								FileAction:         cfg.GlobalCfg.DefaultFilePosture,
+								NetworkAction:      cfg.GlobalCfg.DefaultNetworkPosture,
+								CapabilitiesAction: cfg.GlobalCfg.DefaultCapabilitiesPosture,
+							}
+							endPoint.DefaultPosture = globalDefaultPosture
+
+							dm.SecurityPoliciesLock.RLock()
+							for _, secPol := range dm.SecurityPolicies {
+								if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+									endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
+								}
+							}
+							dm.SecurityPoliciesLock.RUnlock()
+
+							dm.EndPoints = append(dm.EndPoints, endPoint)
+						case "UPDATED":
+							// in case of AppArmor enforcement when endpoint has to be created first
+							endPoint.Containers = append(endPoint.Containers, container.ContainerID)
+
+							// if this container has any additional identities, add them
+							endPoint.Identities = append(endPoint.Identities, containerIdentities...)
+							endPoint.Identities = slices.Compact(endPoint.Identities)
+
+							// add other policies
+							endPoint.SecurityPolicies = []tp.SecurityPolicy{}
+							dm.SecurityPoliciesLock.RLock()
+							for _, secPol := range dm.SecurityPolicies {
+								if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+									endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
+								}
+							}
+							dm.SecurityPoliciesLock.RUnlock()
+
+							dm.EndPoints[endPointIdx] = endPoint
+						}
+						dm.EndPointsLock.Unlock()
+					}
+
 				} else if dm.Containers[container.ContainerID].PidNS == 0 && dm.Containers[container.ContainerID].MntNS == 0 {
 					// this entry was updated by kubernetes before docker detects it
 					// thus, we here use the info given by kubernetes instead of the info given by docker
@@ -243,6 +393,12 @@ func (dm *KubeArmorDaemon) GetAlreadyDeployedDockerContainers() {
 								dm.EndPoints[idx].AppArmorProfiles = append(dm.EndPoints[idx].AppArmorProfiles, container.AppArmorProfile)
 							}
 
+							if container.Privileged && dm.EndPoints[idx].PrivilegedContainers != nil {
+								dm.EndPoints[idx].PrivilegedContainers[container.ContainerName] = struct{}{}
+							}
+
+							endPoint = dm.EndPoints[idx]
+
 							break
 						}
 					}
@@ -260,10 +416,22 @@ func (dm *KubeArmorDaemon) GetAlreadyDeployedDockerContainers() {
 					dm.ContainersLock.Unlock()
 				}
 
+				if cfg.GlobalCfg.StateAgent {
+					go dm.StateAgent.PushContainerEvent(container, state.EventAdded)
+				}
+
 				if dm.SystemMonitor != nil && cfg.GlobalCfg.Policy {
 					// update NsMap
 					dm.SystemMonitor.AddContainerIDToNsMap(container.ContainerID, container.NamespaceName, container.PidNS, container.MntNS)
 					dm.RuntimeEnforcer.RegisterContainer(container.ContainerID, container.PidNS, container.MntNS)
+
+					if len(endPoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
+						dm.Logger.UpdateSecurityPolicies("ADDED", endPoint)
+						if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+							// enforce security policies
+							dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+						}
+					}
 				}
 
 				dm.Logger.Printf("Detected a container (added/%.12s)", container.ContainerID)
@@ -287,7 +455,7 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 		var err error
 
 		// get container information from docker client
-		container, err = Docker.GetContainerInfo(containerID)
+		container, err = Docker.GetContainerInfo(containerID, dm.OwnerInfo)
 		if err != nil {
 			return
 		}
@@ -296,10 +464,89 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 			return
 		}
 
+		endPoint := tp.EndPoint{}
+
 		dm.ContainersLock.Lock()
 		if _, ok := dm.Containers[containerID]; !ok {
 			dm.Containers[containerID] = container
 			dm.ContainersLock.Unlock()
+
+			// create/update endpoint in non-k8s mode
+			if !dm.K8sEnabled {
+				endPointEvent := "ADDED"
+				endPointIdx := -1
+
+				containerLabels, containerIdentities := common.GetLabelsFromString(container.Labels)
+
+				dm.EndPointsLock.Lock()
+				// if a named endpoint exists we update
+				for idx, ep := range dm.EndPoints {
+					if container.ContainerName == ep.EndPointName || kl.MatchIdentities(ep.Identities, containerIdentities) {
+						endPointEvent = "UPDATED"
+						endPointIdx = idx
+						endPoint = ep
+						break
+					}
+				}
+
+				switch endPointEvent {
+				case "ADDED":
+					endPoint.EndPointName = container.ContainerName
+					endPoint.ContainerName = container.ContainerName
+					endPoint.NamespaceName = container.NamespaceName
+
+					endPoint.Containers = []string{container.ContainerID}
+
+					endPoint.Labels = containerLabels
+					endPoint.Identities = containerIdentities
+
+					endPoint.PolicyEnabled = tp.KubeArmorPolicyEnabled
+					endPoint.ProcessVisibilityEnabled = true
+					endPoint.FileVisibilityEnabled = true
+					endPoint.NetworkVisibilityEnabled = true
+					endPoint.CapabilitiesVisibilityEnabled = true
+
+					endPoint.AppArmorProfiles = []string{"kubearmor_" + container.ContainerName}
+
+					globalDefaultPosture := tp.DefaultPosture{
+						FileAction:         cfg.GlobalCfg.DefaultFilePosture,
+						NetworkAction:      cfg.GlobalCfg.DefaultNetworkPosture,
+						CapabilitiesAction: cfg.GlobalCfg.DefaultCapabilitiesPosture,
+					}
+					endPoint.DefaultPosture = globalDefaultPosture
+
+					dm.SecurityPoliciesLock.RLock()
+					for _, secPol := range dm.SecurityPolicies {
+						if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+							endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
+						}
+					}
+					dm.SecurityPoliciesLock.RUnlock()
+
+					dm.EndPoints = append(dm.EndPoints, endPoint)
+				case "UPDATED":
+					// in case of AppArmor enforcement when endpoint has to be created first
+					endPoint.Containers = append(endPoint.Containers, container.ContainerID)
+
+					// if this container has any additional identities, add them
+					endPoint.Identities = append(endPoint.Identities, containerIdentities...)
+					endPoint.Identities = slices.Compact(endPoint.Identities)
+
+					// add other policies
+					endPoint.SecurityPolicies = []tp.SecurityPolicy{}
+					dm.SecurityPoliciesLock.RLock()
+					for _, secPol := range dm.SecurityPolicies {
+						if kl.MatchIdentities(secPol.Spec.Selector.Identities, endPoint.Identities) {
+							endPoint.SecurityPolicies = append(endPoint.SecurityPolicies, secPol)
+						}
+					}
+					dm.SecurityPoliciesLock.RUnlock()
+
+					dm.EndPoints[endPointIdx] = endPoint
+				}
+				dm.EndPointsLock.Unlock()
+			}
+
 		} else if dm.Containers[containerID].PidNS == 0 && dm.Containers[containerID].MntNS == 0 {
 			// this entry was updated by kubernetes before docker detects it
 			// thus, we here use the info given by kubernetes instead of the info given by docker
@@ -330,6 +577,12 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 						dm.EndPoints[idx].AppArmorProfiles = append(dm.EndPoints[idx].AppArmorProfiles, container.AppArmorProfile)
 					}
 
+					if container.Privileged && dm.EndPoints[idx].PrivilegedContainers != nil {
+						dm.EndPoints[idx].PrivilegedContainers[container.ContainerName] = struct{}{}
+					}
+
+					endPoint = dm.EndPoints[idx]
+
 					break
 				}
 			}
@@ -350,14 +603,19 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+
+			if len(endPoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
+				dm.Logger.UpdateSecurityPolicies("ADDED", endPoint)
+				if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+				}
+			}
 		}
 
-		if !dm.K8sEnabled {
-			dm.ContainersLock.Lock()
-			dm.EndPointsLock.Lock()
-			dm.MatchandUpdateContainerSecurityPolicies(containerID)
-			dm.EndPointsLock.Unlock()
-			dm.ContainersLock.Unlock()
+		if cfg.GlobalCfg.StateAgent {
+			container.Status = "running"
+			go dm.StateAgent.PushContainerEvent(container, state.EventAdded)
 		}
 
 		dm.Logger.Printf("Detected a container (added/%.12s)", containerID)
@@ -385,6 +643,22 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 		dm.ContainersLock.Unlock()
 
 		dm.EndPointsLock.Lock()
+		// delete endpoint if no security rules and containers
+		if !dm.K8sEnabled {
+			idx := 0
+			endpointsLength := len(dm.EndPoints)
+			for idx < endpointsLength {
+				endpoint := dm.EndPoints[idx]
+				if container.NamespaceName == endpoint.NamespaceName && container.ContainerName == endpoint.EndPointName &&
+					len(endpoint.SecurityPolicies) == 0 && len(endpoint.Containers) == 0 {
+					dm.EndPoints = append(dm.EndPoints[:idx], dm.EndPoints[idx+1:]...)
+					endpointsLength--
+					idx--
+				}
+				idx++
+			}
+		}
+
 		for idx, endPoint := range dm.EndPoints {
 			if endPoint.NamespaceName == container.NamespaceName && endPoint.EndPointName == container.EndPointName && kl.ContainsElement(endPoint.Containers, container.ContainerID) {
 
@@ -401,6 +675,11 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 		}
 		dm.EndPointsLock.Unlock()
 
+		if cfg.GlobalCfg.StateAgent {
+			container.Status = "terminated"
+			go dm.StateAgent.PushContainerEvent(container, state.EventDeleted)
+		}
+
 		if dm.SystemMonitor != nil && cfg.GlobalCfg.Policy {
 			// update NsMap
 			dm.SystemMonitor.DeleteContainerIDFromNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
@@ -408,6 +687,18 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 		}
 
 		dm.Logger.Printf("Detected a container (removed/%.12s)", containerID)
+	} else if action == "die" && cfg.GlobalCfg.StateAgent {
+		// handle die - keep map but update state
+		dm.ContainersLock.Lock()
+		container, ok := dm.Containers[containerID]
+		if !ok {
+			dm.ContainersLock.Unlock()
+			return
+		}
+		dm.ContainersLock.Unlock()
+
+		container.Status = "waiting"
+		go dm.StateAgent.PushContainerEvent(container, state.EventUpdated)
 	}
 }
 
@@ -441,7 +732,7 @@ func (dm *KubeArmorDaemon) MonitorDockerEvents() {
 
 			// if message type is container
 			if msg.Type == "container" {
-				dm.UpdateDockerContainer(msg.ID, msg.Action)
+				dm.UpdateDockerContainer(msg.ID, string(msg.Action))
 			}
 		}
 	}
